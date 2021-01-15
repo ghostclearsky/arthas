@@ -72,6 +72,7 @@ public class Enhancer implements ClassFileTransformer {
     private final boolean isTracing;
     private final boolean skipJDKTrace;
     private final Matcher classNameMatcher;
+    private final Matcher classNameExcludeMatcher;
     private final Matcher methodNameMatcher;
     private final EnhancerAffect affect;
     private Set<Class<?>> matchingClasses = null;
@@ -93,11 +94,13 @@ public class Enhancer implements ClassFileTransformer {
      * @param affect            影响统计
      */
     public Enhancer(AdviceListener listener, boolean isTracing, boolean skipJDKTrace, Matcher classNameMatcher,
+            Matcher classNameExcludeMatcher,
             Matcher methodNameMatcher) {
         this.listener = listener;
         this.isTracing = isTracing;
         this.skipJDKTrace = skipJDKTrace;
         this.classNameMatcher = classNameMatcher;
+        this.classNameExcludeMatcher = classNameExcludeMatcher;
         this.methodNameMatcher = methodNameMatcher;
         this.affect = new EnhancerAffect();
         affect.setListenerId(listener.id());
@@ -114,7 +117,7 @@ public class Enhancer implements ClassFileTransformer {
                 }
             } catch (Throwable e) {
                 logger.error("the classloader can not load SpyAPI, ignore it. classloader: {}, className: {}",
-                        inClassLoader.getClass().getName(), className);
+                        inClassLoader.getClass().getName(), className, e);
                 return null;
             }
 
@@ -183,6 +186,11 @@ public class Enhancer implements ClassFileTransformer {
             groupLocationFilter.addFilter(invokeExceptionFilter);
 
             for (MethodNode methodNode : matchedMethods) {
+                if (AsmUtils.isNative(methodNode)) {
+                    logger.info("ignore native method: {}",
+                            AsmUtils.methodDeclaration(Type.getObjectType(classNode.name), methodNode));
+                    continue;
+                }
                 // 先查找是否有 atBeforeInvoke 函数，如果有，则说明已经有trace了，则直接不再尝试增强，直接插入 listener
                 if(AsmUtils.containsMethodInsnNode(methodNode, Type.getInternalName(SpyAPI.class), "atBeforeInvoke")) {
                     for (AbstractInsnNode insnNode = methodNode.instructions.getFirst(); insnNode != null; insnNode = insnNode
@@ -303,14 +311,21 @@ public class Enhancer implements ClassFileTransformer {
      *
      * @param classes 类集合
      */
-    private static void filter(Set<Class<?>> classes) {
+    private void filter(Set<Class<?>> classes) {
         final Iterator<Class<?>> it = classes.iterator();
         while (it.hasNext()) {
             final Class<?> clazz = it.next();
-            if (null == clazz || isSelf(clazz) || isUnsafeClass(clazz) || isUnsupportedClass(clazz)) {
+            if (null == clazz || isSelf(clazz) || isUnsafeClass(clazz) || isUnsupportedClass(clazz) || isExclude(clazz)) {
                 it.remove();
             }
         }
+    }
+
+    private boolean isExclude(Class<?> clazz) {
+        if (this.classNameExcludeMatcher != null) {
+            return classNameExcludeMatcher.matching(clazz.getName());
+        }
+        return false;
     }
 
     /**

@@ -29,6 +29,16 @@ public class Configure {
     private String agentId;
 
     /**
+     * @see com.taobao.arthas.common.ArthasConstants#ARTHAS_OUTPUT
+     */
+    private String outputPath;
+
+    /**
+     * 需要被增强的ClassLoader的全类名，多个用英文 , 分隔
+     */
+    private String enhanceLoaders;
+
+    /**
      * <pre>
      * 1. 如果显式传入 arthas.agentId ，则直接使用
      * 2. 如果用户没有指定，则自动尝试在查找应用的 appname，加为前缀，比如 system properties设置 project.name是 demo，则
@@ -133,6 +143,22 @@ public class Configure {
 
     public void setAppName(String appName) {
         this.appName = appName;
+    }
+
+    public String getEnhanceLoaders() {
+        return enhanceLoaders;
+    }
+
+    public void setEnhanceLoaders(String enhanceLoaders) {
+        this.enhanceLoaders = enhanceLoaders;
+    }
+
+    public String getOutputPath() {
+        return outputPath;
+    }
+
+    public void setOutputPath(String outputPath) {
+        this.outputPath = outputPath;
     }
 
     /**

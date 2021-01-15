@@ -9,10 +9,12 @@ import java.lang.reflect.Method;
 import java.security.CodeSource;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Properties;
+import java.util.Set;
 import java.util.Timer;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -25,6 +27,14 @@ import com.alibaba.arthas.deps.ch.qos.logback.classic.LoggerContext;
 import com.alibaba.arthas.deps.org.slf4j.Logger;
 import com.alibaba.arthas.deps.org.slf4j.LoggerFactory;
 import com.alibaba.arthas.tunnel.client.TunnelClient;
+import com.alibaba.bytekit.asm.instrument.InstrumentConfig;
+import com.alibaba.bytekit.asm.instrument.InstrumentParseResult;
+import com.alibaba.bytekit.asm.instrument.InstrumentTransformer;
+import com.alibaba.bytekit.asm.matcher.SimpleClassMatcher;
+import com.alibaba.bytekit.utils.AsmUtils;
+import com.alibaba.bytekit.utils.IOUtils;
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.serializer.SerializerFeature;
 import com.taobao.arthas.common.AnsiLog;
 import com.taobao.arthas.common.ArthasConstants;
 import com.taobao.arthas.common.PidUtils;
@@ -40,6 +50,7 @@ import com.taobao.arthas.core.env.ArthasEnvironment;
 import com.taobao.arthas.core.env.MapPropertySource;
 import com.taobao.arthas.core.env.PropertiesPropertySource;
 import com.taobao.arthas.core.env.PropertySource;
+import com.taobao.arthas.core.server.instrument.ClassLoader_Instrument;
 import com.taobao.arthas.core.shell.ShellServer;
 import com.taobao.arthas.core.shell.ShellServerOptions;
 import com.taobao.arthas.core.shell.command.CommandResolver;
@@ -54,6 +65,7 @@ import com.taobao.arthas.core.shell.term.impl.http.api.HttpApiHandler;
 import com.taobao.arthas.core.shell.term.impl.httptelnet.HttpTelnetTermServer;
 import com.taobao.arthas.core.util.ArthasBanner;
 import com.taobao.arthas.core.util.FileUtils;
+import com.taobao.arthas.core.util.InstrumentationUtils;
 import com.taobao.arthas.core.util.LogUtil;
 import com.taobao.arthas.core.util.UserStatUtil;
 import com.taobao.arthas.core.util.affect.EnhancerAffect;
@@ -85,13 +97,14 @@ public class ArthasBootstrap {
 
     private AtomicBoolean isBindRef = new AtomicBoolean(false);
     private Instrumentation instrumentation;
+    private InstrumentTransformer classLoaderInstrumentTransformer;
     private Thread shutdown;
     private ShellServer shellServer;
     private ScheduledExecutorService executorService;
     private SessionManager sessionManager;
     private TunnelClient tunnelClient;
 
-    private File arthasOutputDir;
+    private File outputPath;
 
     private static LoggerContext loggerContext;
     private EventExecutorGroup workerGroup;
@@ -109,21 +122,29 @@ public class ArthasBootstrap {
     private ArthasBootstrap(Instrumentation instrumentation, Map<String, String> args) throws Throwable {
         this.instrumentation = instrumentation;
 
-        String outputPath = System.getProperty("arthas.output.dir", "arthas-output");
-        arthasOutputDir = new File(outputPath);
-        arthasOutputDir.mkdirs();
+        initFastjson();
 
         // 1. initSpy()
-        initSpy(instrumentation);
+        initSpy();
         // 2. ArthasEnvironment
         initArthasEnvironment(args);
+
+        String outputPathStr = configure.getOutputPath();
+        if (outputPathStr == null) {
+            outputPathStr = ArthasConstants.ARTHAS_OUTPUT;
+        }
+        outputPath = new File(outputPathStr);
+        outputPath.mkdirs();
+
         // 3. init logger
         loggerContext = LogUtil.initLooger(arthasEnvironment);
 
-        // 4. init beans
+        // 4. 增强ClassLoader
+        enhanceClassLoader();
+        // 5. init beans
         initBeans();
 
-        // 5. start agent server
+        // 6. start agent server
         bind(configure);
 
         executorService = Executors.newScheduledThreadPool(1, new ThreadFactory() {
@@ -147,13 +168,22 @@ public class ArthasBootstrap {
         Runtime.getRuntime().addShutdownHook(shutdown);
     }
 
+    private void initFastjson() {
+        // disable  fastjson circular reference feature
+        JSON.DEFAULT_GENERATE_FEATURE |= SerializerFeature.DisableCircularReferenceDetect.getMask();
+        // add date format option for  fastjson
+        JSON.DEFAULT_GENERATE_FEATURE |= SerializerFeature.WriteDateUseDateFormat.getMask();
+        // ignore getter error #1661
+        JSON.DEFAULT_GENERATE_FEATURE |= SerializerFeature.IgnoreErrorGetter.getMask();
+    }
+
     private void initBeans() {
         this.resultViewResolver = new ResultViewResolver();
 
         this.historyManager = new HistoryManagerImpl();
     }
 
-    private static void initSpy(Instrumentation instrumentation) throws Throwable {
+    private void initSpy() throws Throwable {
         // TODO init SpyImpl ?
 
         // 将Spy添加到BootstrapClassLoader
@@ -178,6 +208,36 @@ public class ArthasBootstrap {
         }
     }
 
+    void enhanceClassLoader() throws IOException, UnmodifiableClassException {
+        if (configure.getEnhanceLoaders() == null) {
+            return;
+        }
+        Set<String> loaders = new HashSet<String>();
+        for (String s : configure.getEnhanceLoaders().split(",")) {
+            loaders.add(s.trim());
+        }
+
+        // 增强 ClassLoader#loadClsss ，解决一些ClassLoader加载不到 SpyAPI的问题
+        // https://github.com/alibaba/arthas/issues/1596
+        byte[] classBytes = IOUtils.getBytes(ArthasBootstrap.class.getClassLoader()
+                .getResourceAsStream(ClassLoader_Instrument.class.getName().replace('.', '/') + ".class"));
+
+        SimpleClassMatcher matcher = new SimpleClassMatcher(loaders);
+        InstrumentConfig instrumentConfig = new InstrumentConfig(AsmUtils.toClassNode(classBytes), matcher);
+
+        InstrumentParseResult instrumentParseResult = new InstrumentParseResult();
+        instrumentParseResult.addInstrumentConfig(instrumentConfig);
+        classLoaderInstrumentTransformer = new InstrumentTransformer(instrumentParseResult);
+        instrumentation.addTransformer(classLoaderInstrumentTransformer, true);
+
+        if (loaders.size() == 1 && loaders.contains(ClassLoader.class.getName())) {
+            // 如果只增强 java.lang.ClassLoader，可以减少查找过程
+            instrumentation.retransformClasses(ClassLoader.class);
+        } else {
+            InstrumentationUtils.trigerRetransformClasses(instrumentation, loaders);
+        }
+    }
+    
     private void initArthasEnvironment(Map<String, String> argsMap) throws IOException {
         if (arthasEnvironment == null) {
             arthasEnvironment = new ArthasEnvironment();
@@ -437,6 +497,9 @@ public class ArthasBootstrap {
         if (transformerManager != null) {
             transformerManager.destroy();
         }
+        if (classLoaderInstrumentTransformer != null) {
+            instrumentation.removeTransformer(classLoaderInstrumentTransformer);
+        }
         // clear the reference in Spy class.
         cleanUpSpyReference();
         shutdownWorkGroup();
@@ -566,4 +629,9 @@ public class ArthasBootstrap {
     public HttpApiHandler getHttpApiHandler() {
         return httpApiHandler;
     }
+
+    public File getOutputPath() {
+        return outputPath;
+    }
+
 }
